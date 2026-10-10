@@ -3,9 +3,9 @@ const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middl
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const VERSION = 'v1.3.0';
+const VERSION = 'v1.4.0';
 
-// Cookieから記憶しているURLを取り出す
+// CookieからURLを取り出す
 const getTargetFromCookie = (req) => {
     if (req.headers.cookie) {
         const match = req.headers.cookie.match(/(?:^|; )proxy_url=([^;]*)/);
@@ -16,44 +16,44 @@ const getTargetFromCookie = (req) => {
     return null;
 };
 
-// 1. URLの自動補完 ＆ ループ防止
+// 事前チェック: URLの補完とループ防止
 app.use((req, res, next) => {
-    let inputUrl = req.query.url;
+    if (req.query.url) {
+        let u = req.query.url;
+        if (u === 'home') return next();
 
-    if (inputUrl && inputUrl !== 'home') {
-        // http(s):// が無ければ https:// を自動で付ける
-        if (!/^https?:\/\//i.test(inputUrl)) {
-            inputUrl = 'https://' + inputUrl;
-            req.query.url = inputUrl;
+        // https:// が無ければ付ける
+        if (!/^https?:\/\//i.test(u)) {
+            u = 'https://' + u;
+            req.query.url = u;
         }
-        
-        // 自分のRenderドメインがURLに入り込んでループするのを防ぐ
-        if (inputUrl.includes(req.headers.host)) {
+
+        // 自分のRenderドメインが入り込んでループするのを防ぐ
+        if (req.headers.host && u.includes(req.headers.host)) {
+            return res.redirect('/?url=home');
+        }
+
+        // 存在しない変なURLが打ち込まれたらHomeに戻す
+        try {
+            new URL(u);
+        } catch(e) {
             return res.redirect('/?url=home');
         }
     }
-
-    // アクセス先が不明でHomeでもない場合はHomeに強制送還
-    const target = req.query.url || getTargetFromCookie(req);
-    if (!target && req.path !== '/') {
-        return res.redirect('/?url=home');
-    }
-
     next();
 });
 
-// 2. ホーム画面（?url=home または 指定なし時）
+// Home画面
 app.get('/', (req, res, next) => {
     if (!req.query.url || req.query.url === 'home') {
         
-        // homeの時はCookieを削除してリセット
         if (req.query.url === 'home') {
             res.clearCookie('proxy_url');
         } else if (getTargetFromCookie(req)) {
-            // Cookieが残っている場合はプロキシ処理へ進む
-            return next();
+            return next(); // Cookieがあるならプロキシへ
         }
 
+        // CSS完全排除・左寄せの超シンプルHTML
         return res.send(`
             <!DOCTYPE html>
             <html lang="ja">
@@ -61,63 +61,15 @@ app.get('/', (req, res, next) => {
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>keke pro-xyz</title>
-                <!-- 細いGoogle Fontを読み込み -->
-                <link rel="preconnect" href="https://fonts.googleapis.com">
-                <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-                <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300&display=swap" rel="stylesheet">
-                <style>
-                    /* 全て同じサイズ、左寄せで統一 */
-                    body {
-                        font-family: 'Noto Sans JP', sans-serif;
-                        font-weight: 300;
-                        background-color: #ffffff;
-                        color: #111111;
-                        margin: 0;
-                        padding: 40px 20px;
-                        font-size: 18px;
-                        text-align: left;
-                    }
-                    h1 {
-                        font-size: 18px;
-                        font-weight: 300;
-                        margin: 0 0 20px 0;
-                    }
-                    form {
-                        margin-bottom: 20px;
-                    }
-                    input, button {
-                        font-family: 'Noto Sans JP', sans-serif;
-                        font-weight: 300;
-                        font-size: 18px;
-                        padding: 8px 12px;
-                        margin: 0 10px 10px 0;
-                        border: 1px solid #cccccc;
-                        border-radius: 4px;
-                        background: #ffffff;
-                        color: #111111;
-                    }
-                    input {
-                        width: 300px;
-                        max-width: 100%;
-                    }
-                    button {
-                        cursor: pointer;
-                    }
-                    button:hover {
-                        background: #f0f0f0;
-                    }
-                    .copy {
-                        font-size: 18px;
-                    }
-                </style>
             </head>
             <body>
-                <h1>keke pro-xyz <span>${VERSION}</span></h1>
+                keke pro-xyz ${VERSION}<br><br>
                 <form action="/" method="GET">
-                    <input type="text" name="url" placeholder="example.com" required>
+                    <input type="text" name="url" placeholder="example.com" required size="30">
                     <button type="submit">アクセス</button>
                 </form>
-                <div class="copy">&copy; 2026 keke</div>
+                <br>
+                &copy; 2026 keke
             </body>
             </html>
         `);
@@ -125,7 +77,7 @@ app.get('/', (req, res, next) => {
     next();
 });
 
-// 3. アクセス時にCookieにURLを記憶させる
+// Cookieに保存
 app.use((req, res, next) => {
     if (req.query.url && req.query.url !== 'home') {
         res.cookie('proxy_url', req.query.url, { path: '/' });
@@ -133,17 +85,17 @@ app.use((req, res, next) => {
     next();
 });
 
-// 4. プロキシ本体処理
+// プロキシ本体
 app.use('/', createProxyMiddleware({
-    target: 'http://localhost', // ダミー
+    target: 'http://127.0.0.1', // ダミー
     changeOrigin: true,
     secure: false,
     selfHandleResponse: true,
-    cookieDomainRewrite: '*', // Cookieのドメインを書き換え
-    cookiePathRewrite: '/',   // Cookieのパスも一律ルートに書き換え（ログイン維持率アップ）
+    cookieDomainRewrite: '*', // ログイン情報保持
+    cookiePathRewrite: '/',
 
     router: (req) => {
-        let targetUrlStr = req.query.url || getTargetFromCookie(req);
+        const targetUrlStr = req.query.url || getTargetFromCookie(req);
         if (targetUrlStr && targetUrlStr !== 'home') {
             try { return new URL(targetUrlStr).origin; } catch (e) {}
         }
@@ -162,8 +114,8 @@ app.use('/', createProxyMiddleware({
     onProxyReq: (proxyReq, req, res) => {
         proxyReq.removeHeader('accept-encoding');
         
-        // ★ ログイン突破用: どこからアクセスしたか（Referer / Origin）を対象サイトに合わせて偽装する
-        let targetUrlStr = req.query.url || getTargetFromCookie(req);
+        // 【ログイン対策】対象サイトに合わせてOriginとRefererを偽装
+        const targetUrlStr = req.query.url || getTargetFromCookie(req);
         if (targetUrlStr && targetUrlStr !== 'home') {
             try {
                 const targetObj = new URL(targetUrlStr);
@@ -174,14 +126,14 @@ app.use('/', createProxyMiddleware({
     },
 
     onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
-        let currentUrlStr = req.query.url || getTargetFromCookie(req);
+        const currentUrlStr = req.query.url || getTargetFromCookie(req);
         if (!currentUrlStr || currentUrlStr === 'home') return responseBuffer;
 
-        // リダイレクトの書き換え（ループ防止判定付き）
+        // リダイレクトの書き換え
         if (proxyRes.headers['location']) {
             try {
                 const absoluteLocation = new URL(proxyRes.headers['location'], currentUrlStr).href;
-                if (!absoluteLocation.includes(req.headers.host)) {
+                if (req.headers.host && !absoluteLocation.includes(req.headers.host)) {
                     res.setHeader('location', '/?url=' + encodeURIComponent(absoluteLocation));
                 }
             } catch (e) {}
@@ -189,30 +141,18 @@ app.use('/', createProxyMiddleware({
 
         const contentType = proxyRes.headers['content-type'];
         
-        // HTMLの書き換え処理
         if (contentType && contentType.includes('text/html')) {
             try {
                 let html = responseBuffer.toString('utf8');
-                const host = req.headers.host;
                 
-                // ★ 改良: 絶対パスも相対パス（/img.pngや/favicon.ico）もすべて正しいプロキシURLに一括変換
-                html = html.replace(/(src|href|action)=["']([^"']+)["']/gi, (match, attr, url) => {
-                    // data: や javascript: やページ内リンク(#) は無視
-                    if (url.startsWith('javascript:') || url.startsWith('data:') || url.startsWith('#')) {
-                        return match;
-                    }
-                    try {
-                        const absoluteUrl = new URL(url, currentUrlStr).href;
-                        // すでにプロキシのURLになっているものは二重に変換しない
-                        if (absoluteUrl.includes(host)) return match;
-                        
-                        return `${attr}="/?url=${encodeURIComponent(absoluteUrl)}"`;
-                    } catch (e) {
-                        return match;
-                    }
+                // ★修正: 「絶対URL（http〜）」のみ書き換えるように戻しました。
+                // これによりサイト内の相対パス（/style.css）が壊れず、デザインが正しく表示されます。
+                html = html.replace(/(src|href|action)=["'](https?:\/\/[^"']+)["']/gi, (match, attr, url) => {
+                    if (req.headers.host && url.includes(req.headers.host)) return match;
+                    return `${attr}="/?url=${encodeURIComponent(url)}"`;
                 });
 
-                // クリック横取りJS
+                // リンククリック横取りJS
                 const injectedScript = `
                 <script>
                     document.addEventListener('click', function(e) {
@@ -241,8 +181,8 @@ app.use('/', createProxyMiddleware({
     }),
     
     onError: (err, req, res) => {
-        console.error('[通信エラー]', err.message);
-        res.status(500).send('Proxy Error');
+        // エラー（真っ白）になったら強制的にHomeへ戻す
+        res.redirect('/?url=home');
     }
 }));
 
