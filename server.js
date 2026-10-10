@@ -3,12 +3,9 @@ const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middl
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const VERSION = 'v2.0.0'; // Cookieルーティング採用のメジャーアップデート
+const VERSION = 'v2.1.0'; 
 
-// POSTで送られたフォームデータを読み取るための設定
-app.use(express.urlencoded({ extended: true }));
-
-// Cookieから記憶している「ターゲットドメイン」を取り出す
+// Cookie読み取り
 const getTargetFromCookie = (req) => {
     if (req.headers.cookie) {
         const match = req.headers.cookie.match(/(?:^|; )__proxy_target=([^;]*)/);
@@ -20,12 +17,10 @@ const getTargetFromCookie = (req) => {
 };
 
 // ==========================================
-// 1. ホーム画面 ( /__home ) - CSS完全なし
+// 1. ホーム画面 ( /__home )
 // ==========================================
 app.get('/__home', (req, res) => {
-    // Homeに来たらCookieを消去
     res.clearCookie('__proxy_target', { path: '/' });
-    
     return res.send(`
         <!DOCTYPE html>
         <html lang="ja">
@@ -36,44 +31,43 @@ app.get('/__home', (req, res) => {
         </head>
         <body>
             keke pro-xyz ${VERSION}<br><br>
-            <form action="/__set" method="POST">
+            <!-- フォームは万能トンネル(/__p)へ送信 -->
+            <form action="/__p" method="GET">
                 <input type="text" name="url" placeholder="example.com" required size="30">
                 <button type="submit">アクセス</button>
             </form>
             <br>
             &copy; 2026 keke
-            このサイトはCookieを使用します｡プライベートブラウザではうまく動作しません｡
-            Cookieを使用するのは､ドメインの記録のみです｡
-            ここに戻るにはurlをドメインまで消して「 /__home 」で帰ってきてね
         </body>
         </html>
     `);
 });
 
 // ==========================================
-// 2. アクセス先設定用エンドポイント ( /__set )
+// 2. 万能トンネル ＆ 別ドメインへの遷移用 ( /__p )
 // ==========================================
-// フォーム送信や外部リンククリック時にここを通り、Cookieを更新する
-app.all('/__set', (req, res) => {
-    let u = req.body.url || req.query.url;
+// POSTデータ（ログイン情報など）を壊さずに中継するための仕組み
+app.use('/__p', (req, res, next) => {
+    let u = req.query.url;
     if (!u) return res.redirect('/__home');
-
-    // https:// が無ければ付ける
+    
     if (!/^https?:\/\//i.test(u)) {
         u = 'https://' + u;
     }
-
+    
     try {
         const targetObj = new URL(u);
-        // ドメイン（オリジン）だけをCookieに保存
+        // 新しいドメインをCookieに記憶
         res.cookie('__proxy_target', targetObj.origin, { path: '/' });
         
-        // ターゲットの「パス＋クエリ（/about?id=1など）」へリダイレクト
-        let redirectPath = targetObj.pathname + targetObj.search;
-        if (!redirectPath || redirectPath === '') redirectPath = '/';
+        // プロキシに対して「このドメインに中継してね」と指示を出す
+        req.customTarget = targetObj.origin;
         
-        res.redirect(redirectPath);
-    } catch (e) {
+        // アクセス先のパスを書き換える（例: /login?id=1）
+        req.url = targetObj.pathname + targetObj.search;
+        
+        next();
+    } catch(e) {
         res.redirect('/__home');
     }
 });
@@ -81,10 +75,8 @@ app.all('/__set', (req, res) => {
 // ==========================================
 // 3. ルートチェック
 // ==========================================
-// Cookieが設定されていないのにアクセスしてきたらHomeへ飛ばす
 app.use((req, res, next) => {
-    // /__home と /__set 以外のアクセスでチェック
-    if (req.path !== '/__home' && req.path !== '/__set') {
+    if (req.path !== '/__home' && !req.customTarget) {
         if (!getTargetFromCookie(req)) {
             return res.redirect('/__home');
         }
@@ -96,69 +88,70 @@ app.use((req, res, next) => {
 // 4. プロキシ本体
 // ==========================================
 app.use('/', createProxyMiddleware({
-    target: 'http://127.0.0.1', // ダミー（routerで上書きされる）
+    target: 'http://127.0.0.1', 
     changeOrigin: true,
     secure: false,
     selfHandleResponse: true,
-    cookieDomainRewrite: '*', // ログインCookieを維持
+    cookieDomainRewrite: '*',
     cookiePathRewrite: '/',
 
-    // Cookieに保存されているドメインを接続先に設定
+    // 万能トンネルの指示か、Cookieの記憶から中継先を決定
     router: (req) => {
-        return getTargetFromCookie(req);
+        return req.customTarget || getTargetFromCookie(req);
     },
 
     onProxyReq: (proxyReq, req, res) => {
         proxyReq.removeHeader('accept-encoding');
         
-        const targetOrigin = getTargetFromCookie(req);
+        // ★PC表示にするための偽装
+        proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        
+        const targetOrigin = req.customTarget || getTargetFromCookie(req);
         if (targetOrigin) {
-            // Cloudflare以外の一般的なBot対策やログインチェックをすり抜けるための偽装
             proxyReq.setHeader('Origin', targetOrigin);
-            proxyReq.setHeader('Referer', targetOrigin + '/');
+            // ★画像出ない問題の対策: サイト内の正しいURLからアクセスしているように偽装
+            proxyReq.setHeader('Referer', targetOrigin + req.url);
         }
     },
 
     onProxyRes: responseInterceptor(async (responseBuffer, proxyRes, req, res) => {
-        const targetOrigin = getTargetFromCookie(req);
+        const targetOrigin = req.customTarget || getTargetFromCookie(req);
         if (!targetOrigin) return responseBuffer;
 
-        // リダイレクト処理（Locationヘッダーの書き換え）
+        // リダイレクトの処理
         if (proxyRes.headers['location']) {
             const loc = proxyRes.headers['location'];
-            // 絶対URLでリダイレクトされた場合、同じドメインなら相対パスに変換
             if (loc.startsWith(targetOrigin)) {
                 let rel = loc.replace(targetOrigin, '');
                 if (rel === '') rel = '/';
                 res.setHeader('location', rel);
             } else if (loc.startsWith('http')) {
-                // 別のドメインにリダイレクトされたら /__set を経由させてCookieを切り替える
-                res.setHeader('location', '/__set?url=' + encodeURIComponent(loc));
+                // 別ドメインへのリダイレクトも万能トンネルを通す
+                res.setHeader('location', '/__p?url=' + encodeURIComponent(loc));
             }
         }
 
         const contentType = proxyRes.headers['content-type'];
         
-        // HTMLの中身を賢く書き換え
+        // HTMLの中身の書き換え
         if (contentType && contentType.includes('text/html')) {
             try {
                 let html = responseBuffer.toString('utf8');
                 
-                // href(リンク), src(画像など), action(フォーム送信先) をチェック
                 html = html.replace(/(src|href|action)=["'](https?:\/\/[^"']+)["']/gi, (match, attr, url) => {
-                    // もし「現在のターゲットと同じドメイン」の絶対URLなら、相対パスに短縮する（これが一番バグが起きない）
+                    // 同じドメインなら相対パスに変換
                     if (url.startsWith(targetOrigin)) {
                         let relativePath = url.replace(targetOrigin, '');
                         if (relativePath === '') relativePath = '/';
                         return `${attr}="${relativePath}"`;
                     }
                     
-                    // 「別のドメイン」へのリンク(href)だった場合のみ、/__set を経由させる
-                    if (attr.toLowerCase() === 'href') {
-                        return `${attr}="/__set?url=${encodeURIComponent(url)}"`;
+                    const attrLower = attr.toLowerCase();
+                    // ★ログイン問題の対策: リンク(href)やフォーム送信(action)が別ドメインなら万能トンネルを通す
+                    if (attrLower === 'href' || attrLower === 'action') {
+                        return `${attr}="/__p?url=${encodeURIComponent(url)}"`;
                     }
                     
-                    // 別ドメインの画像(src)などはそのままブラウザに読み込ませる
                     return match;
                 });
                 
@@ -172,7 +165,6 @@ app.use('/', createProxyMiddleware({
     }),
     
     onError: (err, req, res) => {
-        // 接続エラーが起きたらHomeへ戻す
         res.redirect('/__home');
     }
 }));
