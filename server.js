@@ -38,7 +38,7 @@ app.get('/', (req, res, next) => {
             <head>
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>Keke Proxy</title>
+                <title>Proxy</title>
                 <style>
                     body { font-family: sans-serif; text-align: center; padding: 50px 20px; background: #121212; color: #fff; }
                     .container { background: #1e1e1e; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); max-width: 500px; margin: 0 auto; }
