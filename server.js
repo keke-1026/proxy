@@ -22,7 +22,7 @@ const gzip = promisify(zlib.gzip);
 // ==========================================
 const VERSION = 'v3.0.0';
 const PORT = process.env.PORT || 3000;
-const PASSWORD = kekeproxy
+const PROXY_PASSWORD = kekeproxy
 
 // ログインパスワード。未設定なら起動ごとにランダム生成してログに出す（オープンプロキシ防止）
 const PASSWORD_GENERATED = !process.env.PROXY_PASSWORD;
