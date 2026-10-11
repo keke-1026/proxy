@@ -5,7 +5,6 @@ const rateLimit = require('express-rate-limit');
 const { CookieJar } = require('tough-cookie');
 const http = require('http');
 const https = require('https');
-const dns = require('dns');
 const net = require('net');
 const zlib = require('zlib');
 const crypto = require('crypto');
@@ -14,6 +13,7 @@ const path = require('path');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
 const { rewriteHtml, rewriteCss, proxify } = require('./rewrite');
+const { isBlockedIp, safeLookup, ALLOW_PRIVATE } = require('./ssrf');
 
 const gzip = promisify(zlib.gzip);
 
@@ -22,6 +22,7 @@ const gzip = promisify(zlib.gzip);
 // ==========================================
 const VERSION = 'v3.0.0';
 const PORT = process.env.PORT || 3000;
+const PASSWORD = kekeproxy
 
 // ログインパスワード。未設定なら起動ごとにランダム生成してログに出す（オープンプロキシ防止）
 const PASSWORD_GENERATED = !process.env.PROXY_PASSWORD;
@@ -37,47 +38,6 @@ const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS) || 30000;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS) || 200;
 const INSECURE_TLS = process.env.INSECURE_TLS === '1'; // 自己署名証明書などを許可
-const ALLOW_PRIVATE = process.env.ALLOW_PRIVATE === '1'; // ローカル開発/テスト専用。公開時は絶対に有効にしない
-
-// ==========================================
-// SSRF 対策: プライベート/ループバック等への接続を禁止
-// ==========================================
-const blockList = new net.BlockList();
-[
-  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
-  ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.168.0.0', 16],
-  ['198.18.0.0', 15], ['224.0.0.0', 4], ['240.0.0.0', 4],
-].forEach(([a, p]) => blockList.addSubnet(a, p, 'ipv4'));
-[
-  ['::', 128], ['::1', 128], ['::ffff:0:0', 96], ['64:ff9b::', 96],
-  ['fc00::', 7], ['fe80::', 10], ['ff00::', 8],
-].forEach(([a, p]) => blockList.addSubnet(a, p, 'ipv6'));
-
-function isBlockedIp(ip) {
-  if (ALLOW_PRIVATE) return false;
-  const fam = net.isIP(ip);
-  if (!fam) return true;
-  return blockList.check(ip, fam === 6 ? 'ipv6' : 'ipv4');
-}
-
-// 接続時にDNSの結果を検証する（DNS rebinding対策: 検証したIPにそのまま接続する）
-function safeLookup(hostname, options, callback) {
-  if (typeof options === 'function') {
-    callback = options;
-    options = {};
-  }
-  dns.lookup(hostname, { ...options, all: true }, (err, addrs) => {
-    if (err) return callback(err);
-    const ok = addrs.filter((a) => !isBlockedIp(a.address));
-    if (!ok.length) {
-      const e = new Error('blocked address');
-      e.code = 'EBLOCKED';
-      return callback(e);
-    }
-    if (options.all) return callback(null, ok);
-    callback(null, ok[0].address, ok[0].family);
-  });
-}
 
 const agents = {
   'http:': new http.Agent({ keepAlive: true, maxSockets: 128 }),
