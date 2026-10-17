@@ -69,12 +69,41 @@ function isBlockedIp(ip) {
   return v6Rules.check(ip, 'ipv6');
 }
 
+// 検証済みのDNS結果を短時間だけ覚える（新規接続のたびに getaddrinfo を呼ぶのを避ける）。
+// 覚えるのは「検証を通ったIP」だけで、接続もそのIPに対して行うので、DNS rebinding 対策は崩れない。
+const DNS_TTL_MS = 30 * 1000;
+const DNS_CACHE_MAX = 500;
+const dnsCache = new Map();
+
+function cacheGet(key) {
+  const hit = dnsCache.get(key);
+  if (!hit) return null;
+  if (hit.exp < Date.now()) {
+    dnsCache.delete(key);
+    return null;
+  }
+  return hit.addrs;
+}
+
+function cacheSet(key, addrs) {
+  if (dnsCache.size >= DNS_CACHE_MAX) dnsCache.delete(dnsCache.keys().next().value);
+  dnsCache.set(key, { addrs, exp: Date.now() + DNS_TTL_MS });
+}
+
 // 接続時にDNSの結果を検証する（DNS rebinding対策: 検証したIPにそのまま接続する）
 function safeLookup(hostname, options, callback) {
   if (typeof options === 'function') {
     callback = options;
     options = {};
   }
+  const reply = (ok) => {
+    if (options.all) return callback(null, ok);
+    callback(null, ok[0].address, ok[0].family);
+  };
+  const key = `${hostname}|${options.family || 0}`;
+  const cached = cacheGet(key);
+  if (cached) return reply(cached);
+
   dns.lookup(hostname, { ...options, all: true }, (err, addrs) => {
     if (err) return callback(err);
     const ok = addrs.filter((a) => !isBlockedIp(a.address));
@@ -84,8 +113,8 @@ function safeLookup(hostname, options, callback) {
       e.code = 'EBLOCKED';
       return callback(e);
     }
-    if (options.all) return callback(null, ok);
-    callback(null, ok[0].address, ok[0].family);
+    cacheSet(key, ok);
+    reply(ok);
   });
 }
 
