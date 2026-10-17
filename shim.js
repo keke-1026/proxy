@@ -5,7 +5,14 @@
 
   var PROXIED = /^\/p\/https?\/[^/]+(?:[/?#]|$)/;
   var SKIP = /^(#|data:|blob:|javascript:|mailto:|tel:|sms:|about:)/i;
+  var FONT_EXT = /\.(?:woff2?|ttf|otf|eot)$/i;
   var rawFetch = window.fetch ? window.fetch.bind(window) : null;
+  var rawSetAttr = Element.prototype.setAttribute;
+
+  // 外部ドメインの部品(画像/JS/CSS)の扱い: proxy=全部プロキシ経由 / auto=直接取得して失敗したらプロキシ経由 / direct=直接取得のみ
+  var MODE = window.__PX_ASSETS || 'proxy';
+  var DIRECT = MODE === 'auto' || MODE === 'direct';
+  var FALLBACK = MODE === 'auto';
 
   function upstream() {
     var m = /^\/p\/(https?)\/([^/]+)/.exec(location.pathname);
@@ -18,7 +25,8 @@
   }
 
   // 入力URLをプロキシ経由のURLにする。変換不要ならそのまま返す。
-  function toProxy(input) {
+  // asset=true: 画像/JS/CSS などの「部品」。直接取得モードなら、別ホストのURLは絶対URLのまま返す。
+  function toProxy(input, asset) {
     try {
       var s = String(input).trim();
       if (!s || SKIP.test(s)) return input;
@@ -33,9 +41,23 @@
         // /api/x のような絶対パス → 現在の上流サイトのパスとして扱う
         return '/p/' + up.scheme + '/' + up.host + u.pathname + u.search + u.hash;
       }
+      if (asset && DIRECT && u.host !== up.host && !FONT_EXT.test(u.pathname)) return u.href;
       return '/p/' + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
     } catch (e) {
       return input;
+    }
+  }
+
+  // 直接取得に失敗した外部URLを、プロキシ経由のURLにする（外部URLでなければ null）
+  function viaProxy(raw) {
+    try {
+      var up = upstream();
+      if (!up || !raw) return null;
+      var u = new URL(String(raw), location.href);
+      if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) return null;
+      return '/p/' + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
+    } catch (e) {
+      return null;
     }
   }
 
@@ -100,19 +122,24 @@
 
   // setAttribute('src' / 'href' ...)
   guard(function () {
-    var ATTRS = { src: 1, href: 1, action: 1, poster: 1, formaction: 1, data: 1 };
-    var setAttr = Element.prototype.setAttribute;
+    // 値は「部品の読み込み」(true) か「ページ遷移・送信先」(false)
+    var ATTRS = { src: true, poster: true, data: true, action: false, formaction: false };
+    var HREF_ASSET = { link: true, image: true, use: true, script: true };
     Element.prototype.setAttribute = function (name, value) {
       if (typeof name === 'string') {
         var n = name.toLowerCase();
-        if (ATTRS[n] && (n !== 'data' || this.tagName === 'OBJECT')) value = toProxy(value);
+        if (n === 'href') {
+          value = toProxy(value, !!HREF_ASSET[this.localName]);
+        } else if (Object.prototype.hasOwnProperty.call(ATTRS, n) && (n !== 'data' || this.tagName === 'OBJECT')) {
+          value = toProxy(value, ATTRS[n]);
+        }
       }
-      return setAttr.call(this, name, value);
+      return rawSetAttr.call(this, name, value);
     };
   });
 
   // el.src = ... / a.href = ... / form.action = ...
-  function patchProp(ctor, prop) {
+  function patchProp(ctor, prop, asset) {
     guard(function () {
       if (typeof window[ctor] === 'undefined') return;
       var proto = window[ctor].prototype;
@@ -122,16 +149,63 @@
         configurable: true,
         enumerable: d.enumerable,
         get: d.get,
-        set: function (v) { d.set.call(this, toProxy(v)); },
+        set: function (v) { d.set.call(this, toProxy(v, asset)); },
       });
     });
   }
   [
-    ['HTMLAnchorElement', 'href'], ['HTMLAreaElement', 'href'], ['HTMLLinkElement', 'href'],
-    ['HTMLImageElement', 'src'], ['HTMLScriptElement', 'src'], ['HTMLIFrameElement', 'src'],
-    ['HTMLSourceElement', 'src'], ['HTMLMediaElement', 'src'], ['HTMLEmbedElement', 'src'],
-    ['HTMLTrackElement', 'src'], ['HTMLInputElement', 'src'], ['HTMLFormElement', 'action'],
-  ].forEach(function (p) { patchProp(p[0], p[1]); });
+    ['HTMLAnchorElement', 'href', false], ['HTMLAreaElement', 'href', false], ['HTMLLinkElement', 'href', true],
+    ['HTMLImageElement', 'src', true], ['HTMLScriptElement', 'src', true], ['HTMLIFrameElement', 'src', true],
+    ['HTMLSourceElement', 'src', true], ['HTMLMediaElement', 'src', true], ['HTMLEmbedElement', 'src', true],
+    ['HTMLTrackElement', 'src', true], ['HTMLInputElement', 'src', true], ['HTMLFormElement', 'action', false],
+  ].forEach(function (p) { patchProp(p[0], p[1], p[2]); });
+
+  // 直接取得した外部の部品が読み込みに失敗したら（IPブロック・混在コンテンツ・接続不可など）、プロキシ経由で取り直す。
+  // 失敗イベントはバブリングしないので、キャプチャ段階で拾う。
+  if (FALLBACK) {
+    guard(function () {
+      document.addEventListener('error', function (e) {
+        var el = e.target;
+        if (!el || el.__pxRetry || !el.localName || el === window) return;
+        var tag = el.localName;
+        var parent = el.parentNode;
+        var fixed = null;
+        if (tag === 'img') fixed = viaProxy(el.currentSrc || el.getAttribute('src'));
+        else if (tag === 'link' && /stylesheet/i.test(el.getAttribute('rel') || '')) fixed = viaProxy(el.getAttribute('href'));
+        else if (tag === 'script' || tag === 'video' || tag === 'audio') fixed = viaProxy(el.getAttribute('src'));
+        else if (tag === 'source' && parent && /^(video|audio)$/.test(parent.localName)) fixed = viaProxy(el.getAttribute('src'));
+        if (!fixed) return;
+        el.__pxRetry = true;
+
+        if (tag === 'img') {
+          el.removeAttribute('srcset');
+          if (parent && parent.localName === 'picture') {
+            Array.prototype.slice.call(parent.querySelectorAll('source')).forEach(function (s) { parent.removeChild(s); });
+          }
+          rawSetAttr.call(el, 'src', fixed);
+        } else if (tag === 'link') {
+          rawSetAttr.call(el, 'href', fixed);
+        } else if (tag === 'script') {
+          // script は src を変えても再実行されないので、複製して差し替える
+          var n = document.createElement('script');
+          for (var i = 0; i < el.attributes.length; i++) {
+            var at = el.attributes[i];
+            if (at.name !== 'src') rawSetAttr.call(n, at.name, at.value);
+          }
+          n.async = el.hasAttribute('async');
+          n.__pxRetry = true;
+          rawSetAttr.call(n, 'src', fixed);
+          if (parent) parent.insertBefore(n, el.nextSibling);
+        } else if (tag === 'source') {
+          rawSetAttr.call(el, 'src', fixed);
+          if (parent.load) parent.load();
+        } else {
+          rawSetAttr.call(el, 'src', fixed);
+          if (el.load) el.load();
+        }
+      }, true);
+    });
+  }
 
   // document.cookie
   // 上流サイトのCookieはサーバー側のジャーに保存されているので、JS が読み書きする分だけ同期する。
