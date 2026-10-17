@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
-const { rewriteHtml, rewriteCss, proxify } = require('./rewrite');
+const { rewriteHtml, rewriteCss, proxify, isDirect } = require('./rewrite');
 const { isBlockedIp, safeLookup, ALLOW_PRIVATE } = require('./ssrf');
 
 const gzip = promisify(zlib.gzip);
@@ -31,6 +31,12 @@ const PASSWORD = process.env.PROXY_PASSWORD || crypto.randomBytes(9).toString('b
 const DESKTOP_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 const FORCE_UA = process.env.USER_AGENT === 'browser' ? null : process.env.USER_AGENT || DESKTOP_UA;
+
+// 外部ドメインの画像・JS・CSS の扱い
+//   auto   : ブラウザが直接取りに行き、失敗したらプロキシ経由で取り直す（既定。速く、サーバー負荷も小さい）
+//   direct : ブラウザが直接取りに行くだけ（旧v2.1.0と同じ）
+//   proxy  : すべてサーバー経由（ブラウザが外部へ一切つながらない。遅くなり、CDNにサーバーIPを弾かれると表示できない）
+const ASSETS = ['auto', 'direct', 'proxy'].includes(process.env.EXTERNAL_ASSETS) ? process.env.EXTERNAL_ASSETS : 'auto';
 
 const MAX_REWRITE_BYTES = Number(process.env.MAX_REWRITE_BYTES) || 15 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS) || 30000;
@@ -423,8 +429,8 @@ async function sendRewritten({ req, res, upRes, out, kind, target, sess }) {
   const buf = await readAll(stream, MAX_REWRITE_BYTES);
   const text = decodeText(buf, upRes.headers['content-type'], kind);
   const body = kind === 'html'
-    ? rewriteHtml(text, target.href, { cookieString: cookieSnapshot(sess, target) })
-    : rewriteCss(text, target.href);
+    ? rewriteHtml(text, target.href, { cookieString: cookieSnapshot(sess, target), assets: ASSETS })
+    : rewriteCss(text, target.href, { direct: isDirect(ASSETS), baseHost: target.host });
   let bodyBuf = Buffer.from(body, 'utf8');
 
   out['content-type'] = (kind === 'html' ? 'text/html' : 'text/css') + '; charset=utf-8';
@@ -475,6 +481,12 @@ function onUpstreamResponse(req, res, upRes, target, sess) {
   const rewritable = kind && req.method !== 'HEAD' && status !== 204 && status !== 304 && status !== 206;
 
   if (rewritable) {
+    // 最後に開いたページの上流サイトを覚える。JS が作ったルート直下のURL(/api/x や /favicon.ico)で
+    // Referer が付かなかったときの振り分け先に使う。
+    const dest = req.headers['sec-fetch-dest'];
+    if (kind === 'html' && (!dest || dest === 'document')) {
+      sess.lastUpstream = { scheme: target.protocol.slice(0, -1), host: target.host };
+    }
     sendRewritten({ req, res, upRes, out, kind, target, sess }).catch((err) => {
       const [code, msg] = describeError(err);
       sendError(res, code, msg);
@@ -487,15 +499,16 @@ function onUpstreamResponse(req, res, upRes, target, sess) {
   upRes.pipe(res);
 }
 
-app.use('/p', (req, res) => {
+// proxyUrl は /p/<scheme>/<host>/<path>?<query> 形式の文字列
+function proxyRequest(req, res, proxyUrl) {
   if (req.headers['x-keke-hop']) return sendError(res, 508, 'プロキシのループを検出しました。');
 
-  const parsed = parseProxyUrl(req.originalUrl);
+  const parsed = parseProxyUrl(proxyUrl);
   if (!parsed) return sendError(res, 400, 'URLが不正です。');
   const { target, needsSlash } = parsed;
 
   if (needsSlash) {
-    return res.redirect(req.method === 'GET' ? 302 : 307, req.originalUrl.replace(/^(\/p\/https?\/[^/?#]+)/, '$1/'));
+    return res.redirect(req.method === 'GET' ? 302 : 307, proxyUrl.replace(/^(\/p\/https?\/[^/?#]+)/, '$1/'));
   }
   if (target.host.toLowerCase() === String(req.headers.host || '').toLowerCase()) {
     return sendError(res, 403, 'このプロキシ自身には接続できません。');
@@ -533,18 +546,30 @@ app.use('/p', (req, res) => {
   });
 
   req.pipe(upReq);
-});
+}
+
+app.use('/p', (req, res) => proxyRequest(req, res, req.originalUrl));
 
 // ==========================================
 // フォールバック
 // ==========================================
-// JS などが組み立てた「/api/xxx」のようなルート直下のURLは、Referer から元サイトを推定して振り分ける
+// JS などが組み立てた「/api/xxx」のようなルート直下のURLを、元サイトのURLとして扱う。
+// 元サイトは Referer から、無ければ「最後に開いたページ」から推定する。
+const isNavigation = (req) => {
+  const dest = req.headers['sec-fetch-dest'];
+  return req.headers['sec-fetch-mode'] === 'navigate' || dest === 'document' || dest === 'iframe' || dest === 'frame';
+};
+
 app.use((req, res) => {
   const page = upstreamFromReferer(req);
-  if (page) {
-    return res.redirect(307, `/p/${page.protocol.slice(0, -1)}/${page.host}${req.originalUrl}`);
-  }
-  sendError(res, 404, 'ページが見つかりません。');
+  const up = page ? { scheme: page.protocol.slice(0, -1), host: page.host } : req.sess && req.sess.lastUpstream;
+  if (!up) return sendError(res, 404, 'ページが見つかりません。');
+
+  const proxyUrl = `/p/${up.scheme}/${up.host}${req.originalUrl}`;
+  // ページ遷移はアドレスバーと相対URLの基準を正しくするためリダイレクト。
+  // 画像やAPIなどの部品は、往復を増やさないようその場で中継する。
+  if (isNavigation(req)) return res.redirect(307, proxyUrl);
+  proxyRequest(req, res, proxyUrl);
 });
 
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
@@ -558,6 +583,7 @@ const server = app.listen(PORT, () => {
     console.log(`[!] PROXY_PASSWORD が未設定のため一時パスワードを生成しました: ${PASSWORD}`);
     console.log('    (再起動すると変わります。固定する場合は環境変数 PROXY_PASSWORD を設定してください)');
   }
+  console.log(`外部ドメインの部品(画像/JS/CSS): ${ASSETS}`);
   if (ALLOW_PRIVATE) console.log('[!] ALLOW_PRIVATE=1: プライベートIPへの接続が許可されています。公開環境では無効にしてください。');
 });
 
