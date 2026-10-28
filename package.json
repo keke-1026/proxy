@@ -1,7 +1,7 @@
 {
   "name": "proxy",
-  "version": "3.0.0",
-  "description": "keke pro-xyz - Node.js web proxy",
+  "version": "3.1.0",
+  "description": "keke pro-xyz",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
