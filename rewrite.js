@@ -1,6 +1,6 @@
 'use strict';
 // HTML / CSS の URL 書き換え。
-// 上流URL(https://example.com/a/b) を  /p/https/example.com/a/b  に変換する。
+// 上流URL(https://example.com/a/b) を  /p/<base64url(https://example.com)>/a/b  に変換する（urlcodec.js）。
 //
 // 外部ドメインの画像・JS・CSS などの扱い（EXTERNAL_ASSETS）:
 //   proxy  : すべてプロキシ経由（サーバーの負荷は増えるが、ブラウザが外部へ直接つながらない）
@@ -9,6 +9,7 @@
 // ページ遷移(<a href> / <form action>)は、どのモードでも必ずプロキシ経由。
 
 const cheerio = require('cheerio');
+const { toProxyPath } = require('./urlcodec');
 
 const SKIP = /^(#|data:|blob:|javascript:|mailto:|tel:|sms:|about:)/i;
 
@@ -44,7 +45,7 @@ function proxify(raw, base, ctx, asset) {
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return raw;
   if (asset && ctx && ctx.direct && u.host !== ctx.baseHost && !FONT_EXT.test(u.pathname)) return u.href;
-  return `/p/${u.protocol.slice(0, -1)}/${u.host}${u.pathname}${u.search}${u.hash}`;
+  return toProxyPath(u);
 }
 
 /** CSS 内の url(...) と @import を書き換える */
@@ -91,9 +92,10 @@ function jsonForScript(s) {
  * HTML を書き換える。
  * @param {string} html
  * @param {string} docUrl 上流ドキュメントの絶対URL
- * @param {{cookieString?: string, assets?: 'proxy'|'auto'|'direct'}} opts
+ * @param {{cookieString?: string, assets?: 'proxy'|'auto'|'direct', debug?: boolean}} opts
  *   cookieString: JS から見える (HttpOnlyでない) Cookie
  *   assets: 外部の部品の扱い（既定 proxy）
+ *   debug: ページ内のJSエラーをサーバーのログへ送る
  */
 function rewriteHtml(html, docUrl, opts = {}) {
   const mode = opts.assets || 'proxy';
@@ -176,7 +178,7 @@ function rewriteHtml(html, docUrl, opts = {}) {
   const inject =
     '<meta charset="utf-8">' +
     '<meta name="referrer" content="same-origin">' +
-    `<script>window.__PX_COOKIES=${jsonForScript(opts.cookieString || '')};window.__PX_ASSETS=${jsonForScript(mode)};</script>` +
+    `<script>window.__PX_COOKIES=${jsonForScript(opts.cookieString || '')};window.__PX_ASSETS=${jsonForScript(mode)};${opts.debug ? 'window.__PX_DEBUG=true;' : ''}</script>` +
     '<script src="/__shim.js"></script>';
   $('head').prepend(inject);
 
