@@ -3,7 +3,7 @@
 (function () {
   'use strict';
 
-  var PROXIED = /^\/p\/https?\/[^/]+(?:[/?#]|$)/;
+  var PROXIED = /^\/p\/(?:https?\/[^/]+|[A-Za-z0-9_-]{6,})(?:[/?#]|$)/;
   var SKIP = /^(#|data:|blob:|javascript:|mailto:|tel:|sms:|about:)/i;
   var FONT_EXT = /\.(?:woff2?|ttf|otf|eot)$/i;
   var rawFetch = window.fetch ? window.fetch.bind(window) : null;
@@ -14,14 +14,37 @@
   var DIRECT = MODE === 'auto' || MODE === 'direct';
   var FALLBACK = MODE === 'auto';
 
+  // プロキシURLは /p/<base64url(オリジン)>/<パス>。オリジンだけを符号化するので、相対URLはブラウザの標準の解決で動く。
+  function b64e(s) { return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+  function b64d(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    return atob(s);
+  }
+  function proxyPath(u) { return '/p/' + b64e(u.origin) + u.pathname + u.search + u.hash; }
+
+  // /p/... を { origin, scheme, host, rest } に分解（旧形式 /p/<scheme>/<host>/... も読める）
+  function parseProxyPath(pathname) {
+    var m = /^\/p\/(https?)\/([^/]+)(\/.*)?$/.exec(pathname);
+    if (m) return { origin: m[1] + '://' + m[2], scheme: m[1], host: m[2], rest: m[3] || '/' };
+    m = /^\/p\/([A-Za-z0-9_-]{6,})(\/.*)?$/.exec(pathname);
+    if (!m) return null;
+    try {
+      var o = new URL(b64d(m[1]));
+      if (o.protocol !== 'http:' && o.protocol !== 'https:') return null;
+      return { origin: o.origin, scheme: o.protocol.slice(0, -1), host: o.host, rest: m[2] || '/' };
+    } catch (e) {
+      return null;
+    }
+  }
+
   function upstream() {
-    var m = /^\/p\/(https?)\/([^/]+)/.exec(location.pathname);
-    return m ? { scheme: m[1], host: m[2] } : null;
+    return parseProxyPath(location.pathname);
   }
 
   function upstreamHref() {
-    var m = /^\/p\/(https?)\/([^/]+)(\/[^?#]*)?/.exec(location.pathname);
-    return m ? m[1] + '://' + m[2] + (m[3] || '/') + location.search : null;
+    var p = parseProxyPath(location.pathname);
+    return p ? p.origin + p.rest + location.search : null;
   }
 
   // 入力URLをプロキシ経由のURLにする。変換不要ならそのまま返す。
@@ -39,10 +62,10 @@
         // すでに /p/... なら（相対URLの解決結果も含めて）そのまま
         if (PROXIED.test(u.pathname)) return input;
         // /api/x のような絶対パス → 現在の上流サイトのパスとして扱う
-        return '/p/' + up.scheme + '/' + up.host + u.pathname + u.search + u.hash;
+        return '/p/' + b64e(up.origin) + u.pathname + u.search + u.hash;
       }
       if (asset && DIRECT && u.host !== up.host && !FONT_EXT.test(u.pathname)) return u.href;
-      return '/p/' + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
+      return proxyPath(u);
     } catch (e) {
       return input;
     }
@@ -55,7 +78,7 @@
       if (!up || !raw) return null;
       var u = new URL(String(raw), location.href);
       if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.origin === location.origin) return null;
-      return '/p/' + u.protocol.slice(0, -1) + '/' + u.host + u.pathname + u.search + u.hash;
+      return proxyPath(u);
     } catch (e) {
       return null;
     }
@@ -204,6 +227,48 @@
           if (el.load) el.load();
         }
       }, true);
+    });
+  }
+
+  // Service Worker
+  // 上流サイトが登録した Service Worker は、プロキシ全体(同じオリジン)の通信を横取りして壊してしまうので、
+  // 登録を拒否し、残っている登録も解除する。
+  guard(function () {
+    var sw = navigator.serviceWorker;
+    if (!sw) return;
+    sw.register = function () {
+      return Promise.reject(new DOMException('Service Worker is disabled by the proxy', 'SecurityError'));
+    };
+    if (sw.getRegistrations) {
+      sw.getRegistrations().then(function (rs) {
+        rs.forEach(function (r) { r.unregister(); });
+      }).catch(function () {});
+    }
+  });
+
+  // 診断(DEBUG_LOG=1 のとき): ページ内のJSエラー・読み込み失敗・未処理のPromise拒否を、サーバーのログへ送る
+  if (window.__PX_DEBUG && rawFetch) {
+    guard(function () {
+      var sent = 0;
+      var report = function (kind, msg) {
+        if (sent++ >= 60) return;
+        rawFetch('/__log', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ kind: kind, msg: String(msg).slice(0, 400), page: upstreamHref() }),
+          keepalive: true,
+          credentials: 'same-origin',
+        }).catch(function () {});
+      };
+      window.addEventListener('error', function (e) {
+        var t = e.target;
+        if (t && t !== window && t.localName) report('resource', t.localName + ' ' + (t.currentSrc || t.src || t.href || ''));
+        else report('js', (e.message || '') + ' @' + (e.filename || '') + ':' + (e.lineno || '') + ':' + (e.colno || ''));
+      }, true);
+      window.addEventListener('unhandledrejection', function (e) {
+        var r = e.reason;
+        report('promise', r && (r.stack || r.message) || r);
+      });
     });
   }
 
