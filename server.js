@@ -13,6 +13,7 @@ const path = require('path');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
 const { rewriteHtml, rewriteCss, proxify, isDirect } = require('./rewrite');
+const { encodeOrigin, decodeOrigin, toProxyPath, decodeBase64Text } = require('./urlcodec');
 const { isBlockedIp, safeLookup, ALLOW_PRIVATE } = require('./ssrf');
 
 const gzip = promisify(zlib.gzip);
@@ -20,7 +21,7 @@ const gzip = promisify(zlib.gzip);
 // ==========================================
 // 設定（環境変数）
 // ==========================================
-const VERSION = 'v3.0.0';
+const VERSION = 'v3.1.0';
 const PORT = process.env.PORT || 3000;
 
 // ログインパスワード。未設定なら起動ごとにランダム生成してログに出す（オープンプロキシ防止）
@@ -37,6 +38,10 @@ const FORCE_UA = process.env.USER_AGENT === 'browser' ? null : process.env.USER_
 //   direct : ブラウザが直接取りに行くだけ（旧v2.1.0と同じ）
 //   proxy  : すべてサーバー経由（ブラウザが外部へ一切つながらない。遅くなり、CDNにサーバーIPを弾かれると表示できない）
 const ASSETS = ['auto', 'direct', 'proxy'].includes(process.env.EXTERNAL_ASSETS) ? process.env.EXTERNAL_ASSETS : 'auto';
+
+// DEBUG_LOG=1: 上流がエラー(4xx/5xx・接続失敗)を返したURLと、ページ内のJSエラーをログに出す。
+// 「動かないサイトの原因」を調べるためのもの。訪問先のURLがログに残るので、普段は無効のままにする。
+const DEBUG = process.env.DEBUG_LOG === '1';
 
 const MAX_REWRITE_BYTES = Number(process.env.MAX_REWRITE_BYTES) || 15 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS) || 30000;
@@ -114,7 +119,7 @@ function sendPage(res, status, title, body) {
       'cache-control': 'no-store',
       'x-content-type-options': 'nosniff',
       'x-frame-options': 'DENY',
-      'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'",
+      'content-security-policy': "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'",
     })
     .type('html')
     .send(`<!DOCTYPE html>
@@ -247,18 +252,60 @@ app.get('/', (req, res) => {
     200,
     'keke pro-xyz',
     `<h1>keke pro-xyz ${escapeHtml(VERSION)}</h1>
-<form action="/go" method="GET">
+<form id="f" action="/go" method="GET">
   <input type="text" name="url" placeholder="example.com または検索ワード" autofocus required>
   <button type="submit">アクセス</button>
   ${req.query.e ? '<p class="err">URLを解釈できませんでした。</p>' : ''}
 </form>
-<footer><p><a href="/logout">ログアウト</a><br>&copy; 2026 keke</p></footer>`
+<footer><p><a href="/logout">ログアウト</a><br>&copy; 2026 keke</p></footer>
+<script src="/__home.js"></script>`
   );
 });
 
-// URL入力 → /p/... へ。スキームなしなら https:// を補い、URLらしくなければ検索する
+// ホーム画面のフォーム: 入力されたURLをブラウザ側でbase64にして /go?u=... へ送る。
+// 平文のURLが、履歴やサーバーへのリクエストに残らない。(JSが無効なら /go?url=... にフォールバック)
+const HOME_JS = String.raw`(function () {
+  var f = document.getElementById('f');
+  if (!f) return;
+  function normalize(v) {
+    v = v.trim();
+    if (!v) return null;
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) {
+      if (/\s/.test(v) || !/[.:]/.test(v)) v = 'https://html.duckduckgo.com/html/?q=' + encodeURIComponent(v);
+      else v = 'https://' + v;
+    }
+    return v;
+  }
+  f.addEventListener('submit', function (e) {
+    try {
+      var v = normalize(f.elements.url.value);
+      if (!v) return;
+      var u = new URL(v);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+      e.preventDefault();
+      location.href = '/go?u=' + btoa(u.href).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    } catch (err) { /* 失敗したら通常の送信 */ }
+  });
+})();
+`;
+
+app.get('/__home.js', (req, res) => {
+  res.set({ 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'private, max-age=300' }).send(HOME_JS);
+});
+
+// URL入力 → /p/<base64(オリジン)>/... へ。
+//   /go?u=<URLをbase64(またはbase64url)にしたもの>   例: /go?u=aHR0cHM6Ly9leGFtcGxlLmNvbS9hP3g9MQ
+//   /go?url=<平文のURL・ドメイン・検索ワード>
+// スキームなしなら https:// を補い、URLらしくなければ検索する
 app.get('/go', (req, res) => {
-  let u = String(req.query.url || '').trim();
+  let u;
+  if (req.query.u) {
+    u = decodeBase64Text(req.query.u);
+    if (!u) return res.redirect('/?e=1');
+  } else {
+    u = String(req.query.url || '');
+  }
+  u = u.trim();
   if (!u) return res.redirect('/');
   if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(u)) {
     if (/\s/.test(u) || !/[.:]/.test(u)) {
@@ -270,10 +317,16 @@ app.get('/go', (req, res) => {
   try {
     const t = new URL(u);
     if (t.protocol !== 'http:' && t.protocol !== 'https:') throw new Error('scheme');
-    res.redirect(proxify(t.href, t.href));
+    res.redirect(toProxyPath(t));
   } catch {
     res.redirect('/?e=1');
   }
+});
+
+// ページ内のJSエラーを受け取ってログに出す（DEBUG_LOG=1 のときだけ。shim.js が送る）
+app.post('/__log', express.json({ limit: '4kb' }), (req, res) => {
+  if (DEBUG) console.log('[client]', JSON.stringify(req.body || {}).slice(0, 700));
+  res.sendStatus(204);
 });
 
 app.get('/__shim.js', (req, res) => {
@@ -296,7 +349,7 @@ app.post('/__cookie', express.json({ limit: '8kb' }), (req, res) => {
 });
 
 // ==========================================
-// プロキシ本体:  /p/<scheme>/<host>/<path>?<query>
+// プロキシ本体:  /p/<base64url(オリジン)>/<path>?<query>   (旧形式 /p/<scheme>/<host>/<path> も受け付ける)
 // ==========================================
 const HOP = [
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection',
@@ -313,22 +366,47 @@ const DROP_RES = new Set([
   'cross-origin-resource-policy', 'link', 'alt-svc', 'clear-site-data',
 ]);
 
-const PROXY_PATH = /^\/p\/(https?)\/([^/?#]+)([^?#]*)(\?[^#]*)?/;
+const LEGACY_PATH = /^\/p\/(https?)\/([^/?#]+)([^?#]*)(\?[^#]*)?/; // 旧形式 /p/<scheme>/<host>/<path>
+const ENCODED_PATH = /^\/p\/([A-Za-z0-9_-]+)([^?#]*)(\?[^#]*)?/;    // /p/<base64url(オリジン)>/<path>
 const HOST_OK = /^(?:[a-z0-9_.-]+|\[[0-9a-f:.]+\])(?::\d{1,5})?$/i;
 
+// 戻り値: { target: URL(上流の完全なURL), needsSlash: パスが無いか, prefix: /p/... のオリジン部分 }
 function parseProxyUrl(url) {
-  const m = PROXY_PATH.exec(url);
-  if (!m) return null;
-  const [, scheme, hostSeg, p, q] = m;
-  if (!HOST_OK.test(hostSeg)) return null;
+  let originUrl;
+  let prefix;
+  let p;
+  let q;
+
+  const lm = LEGACY_PATH.exec(url);
+  if (lm) {
+    const [, scheme, hostSeg] = lm;
+    if (!HOST_OK.test(hostSeg)) return null;
+    try {
+      originUrl = new URL(`${scheme.toLowerCase()}://${hostSeg}`);
+    } catch {
+      return null;
+    }
+    prefix = `/p/${scheme}/${hostSeg}`;
+    p = lm[3];
+    q = lm[4];
+  } else {
+    const em = ENCODED_PATH.exec(url);
+    if (!em) return null;
+    originUrl = decodeOrigin(em[1]);
+    if (!originUrl || !HOST_OK.test(originUrl.host)) return null;
+    prefix = `/p/${em[1]}`;
+    p = em[2];
+    q = em[3];
+  }
+
   let target;
   try {
-    target = new URL(`${scheme}://${hostSeg}${p || '/'}${q || ''}`);
+    target = new URL(`${originUrl.origin}${p || '/'}${q || ''}`);
   } catch {
     return null;
   }
   if (target.username || target.password) return null;
-  return { target, needsSlash: !p };
+  return { target, needsSlash: !p, prefix, query: q || '' };
 }
 
 // Referer が「プロキシ内のページ」なら、そのページの上流URLを返す
@@ -429,7 +507,7 @@ async function sendRewritten({ req, res, upRes, out, kind, target, sess }) {
   const buf = await readAll(stream, MAX_REWRITE_BYTES);
   const text = decodeText(buf, upRes.headers['content-type'], kind);
   const body = kind === 'html'
-    ? rewriteHtml(text, target.href, { cookieString: cookieSnapshot(sess, target), assets: ASSETS })
+    ? rewriteHtml(text, target.href, { cookieString: cookieSnapshot(sess, target), assets: ASSETS, debug: DEBUG })
     : rewriteCss(text, target.href, { direct: isDirect(ASSETS), baseHost: target.host });
   let bodyBuf = Buffer.from(body, 'utf8');
 
@@ -456,6 +534,7 @@ async function sendRewritten({ req, res, upRes, out, kind, target, sess }) {
 
 function onUpstreamResponse(req, res, upRes, target, sess) {
   const status = upRes.statusCode;
+  if (DEBUG && status >= 400) console.log('[up]', status, req.method, target.href);
 
   const setCookies = upRes.headers['set-cookie'];
   if (setCookies) {
@@ -485,7 +564,7 @@ function onUpstreamResponse(req, res, upRes, target, sess) {
     // Referer が付かなかったときの振り分け先に使う。
     const dest = req.headers['sec-fetch-dest'];
     if (kind === 'html' && (!dest || dest === 'document')) {
-      sess.lastUpstream = { scheme: target.protocol.slice(0, -1), host: target.host };
+      sess.lastUpstream = { origin: target.origin };
     }
     sendRewritten({ req, res, upRes, out, kind, target, sess }).catch((err) => {
       const [code, msg] = describeError(err);
@@ -505,10 +584,10 @@ function proxyRequest(req, res, proxyUrl) {
 
   const parsed = parseProxyUrl(proxyUrl);
   if (!parsed) return sendError(res, 400, 'URLが不正です。');
-  const { target, needsSlash } = parsed;
+  const { target, needsSlash, prefix, query } = parsed;
 
   if (needsSlash) {
-    return res.redirect(req.method === 'GET' ? 302 : 307, proxyUrl.replace(/^(\/p\/https?\/[^/?#]+)/, '$1/'));
+    return res.redirect(req.method === 'GET' ? 302 : 307, `${prefix}/${query}`);
   }
   if (target.host.toLowerCase() === String(req.headers.host || '').toLowerCase()) {
     return sendError(res, 403, 'このプロキシ自身には接続できません。');
@@ -534,6 +613,7 @@ function proxyRequest(req, res, proxyUrl) {
     upReq.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }));
   });
   upReq.on('error', (err) => {
+    if (DEBUG) console.log('[up] error', (err && (err.code || err.message)) || 'unknown', req.method, target.href);
     const [code, msg] = describeError(err);
     sendError(res, code, msg);
   });
@@ -562,10 +642,10 @@ const isNavigation = (req) => {
 
 app.use((req, res) => {
   const page = upstreamFromReferer(req);
-  const up = page ? { scheme: page.protocol.slice(0, -1), host: page.host } : req.sess && req.sess.lastUpstream;
+  const up = page ? { origin: page.origin } : req.sess && req.sess.lastUpstream;
   if (!up) return sendError(res, 404, 'ページが見つかりません。');
 
-  const proxyUrl = `/p/${up.scheme}/${up.host}${req.originalUrl}`;
+  const proxyUrl = `/p/${encodeOrigin(up.origin)}${req.originalUrl}`;
   // ページ遷移はアドレスバーと相対URLの基準を正しくするためリダイレクト。
   // 画像やAPIなどの部品は、往復を増やさないようその場で中継する。
   if (isNavigation(req)) return res.redirect(307, proxyUrl);
